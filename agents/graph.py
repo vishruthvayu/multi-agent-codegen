@@ -15,10 +15,38 @@ from langchain_core.globals import set_verbose, set_debug
 import re
 import time
 
+import json 
+import pathlib
+
 load_dotenv()
 
 set_debug(False)
 set_verbose(False)
+
+CHECKPOINT_FILE = pathlib.Path("checkpoint.json");
+
+def save_checkpoint(coder_state: CoderState):
+    data = coder_state.model_dump()
+    CHECKPOINT_FILE.write_text(json.dumps(data,indent=2))
+    print(f"checkpoint step {coder_state.current_step_idx}")
+
+
+def load_checkpoint() -> CoderState | None:
+    if not CHECKPOINT_FILE.exists():
+        return None
+    try:
+        data = json.loads(CHECKPOINT_FILE.read_text())
+        state = CoderState.model_validate(data)
+        print(f"loaded checkpoint step {state.current_step_idx}")
+        return state
+    except Exception as e:
+        print(f"failed to load checkpoint: {e}")
+        return None
+    
+def clear_checkpoint():
+    if CHECKPOINT_FILE.exists():
+        CHECKPOINT_FILE.unlink()
+        print("checkpoint cleared")
 
 # =========================
 # MODELS
@@ -100,6 +128,10 @@ def safe_agent_invoke(agent, payload, retries=3):
 # =========================
 
 def planner_agent(state: dict) -> dict:
+    if state.get("coder_state") is not None:
+        print("[Planner skipped] resuming from checkpoint")
+        return {}
+
     user_prompt = state.get("user_prompt")
 
     resp = planner_llm.with_structured_output(Plan).invoke(
@@ -116,6 +148,11 @@ def planner_agent(state: dict) -> dict:
 # =========================
 
 def architect_agent(state: dict) -> dict:
+
+    if state.get("coder_state") is not None:
+        print("[Architect skipped] resuming from checkpoint")
+        return {}
+    
     plan: Plan = state.get("plan")
 
     resp = architect_llm.with_structured_output(TaskPlan).invoke(
@@ -134,7 +171,6 @@ def architect_agent(state: dict) -> dict:
 # =========================
 
 def coder_agent(state: dict) -> dict:
-
     coder_state: CoderState = state.get("coder_state")
 
     if coder_state is None:
@@ -146,11 +182,11 @@ def coder_agent(state: dict) -> dict:
     steps = coder_state.task_plan.implementation_steps
 
     if coder_state.current_step_idx >= len(steps):
+        clear_checkpoint()
         return {
             "coder_state": coder_state,
             "status": "DONE",
         }
-
     current_task = steps[coder_state.current_step_idx]
 
     print("\n==============================")
@@ -221,7 +257,16 @@ INSTRUCTIONS:
     print(validation)
     print("==============================\n")
 
+# verify file was actually created
+    written = read_file.invoke(current_task.filepath)
+    if not written:
+        print(f"\n[WARNING] {current_task.filepath} was not written, retrying step...\n")
+        save_checkpoint(coder_state)
+        return {"coder_state": coder_state}  # retry same step
+
     coder_state.current_step_idx += 1
+
+    save_checkpoint(coder_state)
 
     return {"coder_state": coder_state}
 
@@ -256,9 +301,14 @@ agent = graph.compile()
 # =========================
 
 if __name__ == "__main__":
+    # load checkpoint if exists
+    checkpoint = load_checkpoint()
 
-    result = agent.invoke(
-        {
+    if checkpoint:
+        print(f"\n[Resuming from step {checkpoint.current_step_idx + 1}]\n")
+        initial_state = {"coder_state": checkpoint}
+    else:
+        initial_state = {
             "user_prompt": """
 Build a modern responsive weather dashboard using html css and javascript.
 
@@ -276,10 +326,11 @@ Requirements:
 Use only vanilla html css and javascript.
 Keep the project to a maximum of 3 files.
 """
-        },
-        {
-            "recursion_limit": 25
-        },
+        }
+
+    result = agent.invoke(
+        initial_state,
+        {"recursion_limit": 25},
     )
 
     print("\nFINAL STATE:\n")
